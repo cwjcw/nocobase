@@ -1,6 +1,6 @@
 # nocobase
 
-用于存放 NocoBase API 调用示例与封装代码（增删改查）。
+用于存放 NocoBase API 调用示例与封装代码（Database/Collections/Records 增删改查）。
 
 ## 环境准备（建议虚拟环境）
 
@@ -31,17 +31,15 @@ python .\write_test1.py --collection test1 --name "测试数据" --quantity 12.3
 
 封装文件：`nocobase_client.py`
 
+更详细的每个函数说明见：`DATABASE_API.md`
+
 示例代码（创建/查询/更新/删除）：
 
 ```python
 import os
-from nocobase_client import NocoBaseClient, load_env_file
+from nocobase_client import NocoBaseClient
 
-load_env_file(".env")
-client = NocoBaseClient(
-    base_url=os.environ["NOCOBASE_BASE_URL"],
-    token=os.environ["NOCOBASE_TOKEN"],
-)
+client = NocoBaseClient.from_env(".env")
 
 created = client.create("test1", {"name": "hello", "f_h2v1n6u8mfh": 1.23})
 pk = created["data"]["id"]
@@ -50,4 +48,3 @@ print(client.get("test1", pk=pk))
 print(client.update("test1", pk=pk, values={"name": "world"}))
 print(client.destroy("test1", pk=pk))
 ```
-
