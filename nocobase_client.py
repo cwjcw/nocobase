@@ -375,18 +375,29 @@ class NocoBaseClient:
 
         对应 action：GET /api/collections:get
 
-        入参通常是 query 参数，常见写法可能是：
-        - ?name=<collectionName>
+        入参通常是 query 参数；在你当前环境中，推荐使用：
         - ?filterByTk=<collectionName>
+        并配合：
+        - appends=fields（让响应包含字段定义，便于做列映射/校验）
 
-        本函数会自动按上述顺序尝试。
+        注意：有些环境下 `?name=` 可能会被忽略但仍返回 200（返回默认/第一张表），
+        所以本函数会校验返回的 data.name 是否等于目标 name；不匹配会继续尝试。
         """
 
-        attempts: List[Dict[str, Any]] = [{"name": name}, {"filterByTk": name}]
+        attempts: List[Dict[str, Any]] = [
+            {"filterByTk": name, "appends": "fields"},
+            {"filterByTk": name},
+            {"name": name, "appends": "fields"},
+            {"name": name},
+        ]
         last_exc: Optional[Exception] = None
         for params in attempts:
             try:
-                return self.request("GET", "collections:get", params=params)
+                resp = self.request("GET", "collections:get", params=params)
+                data = resp.get("data")
+                if isinstance(data, dict) and data.get("name") == name:
+                    return resp
+                last_exc = RuntimeError("collections_get 返回的 data.name 与期望不一致")
             except Exception as exc:
                 last_exc = exc
         raise last_exc or RuntimeError("collections_get failed")
@@ -459,4 +470,3 @@ class NocoBaseClient:
         """
 
         return self.request("POST", "collections:setFields", json=payload)
-
