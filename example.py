@@ -17,10 +17,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from typing import Any, Dict
 
 from nocobase_client import NocoBaseClient
+from table_utils import extract_rows, format_table
 
 
 def pretty(obj: Any) -> str:
@@ -143,6 +145,8 @@ def run_records_crud(client: NocoBaseClient, *, collection: str) -> int:
     listed = example_records_list(client, collection=collection, params={"page": 1, "pageSize": 5})
     print("\n== records.list (page 1, pageSize 5) ==")
     print(pretty(listed))
+    print("\n== records.list as table ==")
+    print(format_table(extract_rows(listed), columns=["id", "name", "f_h2v1n6u8mfh", "createdAt"]))
     return 0
 
 
@@ -208,10 +212,16 @@ def run_collections_safe(client: NocoBaseClient, *, name: str) -> int:
     """
 
     print("== collections.list ==")
-    print(pretty(example_collections_list(client)))
+    resp = example_collections_list(client)
+    print(pretty(resp))
+    print("\n== collections.list as table ==")
+    print(format_table(extract_rows(resp), columns=["name", "title", "template", "type"]))
 
     print("\n== collections.get ==")
-    print(pretty(example_collections_get(client, name=name)))
+    got = example_collections_get(client, name=name)
+    print(pretty(got))
+    print("\n== collections.get as table ==")
+    print(format_table(extract_rows(got)))
     return 0
 
 
@@ -284,6 +294,17 @@ def main() -> int:
     act.add_argument("--params", default=None, help="query 参数 JSON 字符串")
     act.add_argument("--json", default=None, help="body JSON 字符串")
 
+    # 用户直接运行 `python example.py` 时，打印帮助而不是报错
+    if len(sys.argv) == 1:
+        parser.print_help()
+        print(
+            "\n示例：\n"
+            "  python .\\example.py records-crud --collection test1\n"
+            "  python .\\example.py collections-safe --name test1\n"
+            "  python .\\example.py action --method GET --path collections:list\n"
+        )
+        return 0
+
     args = parser.parse_args()
 
     # 客户端初始化：从 env 读取 NOCOBASE_BASE_URL / NOCOBASE_TOKEN
@@ -312,4 +333,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -3,6 +3,7 @@ import json
 from typing import Any, Dict, Optional
 
 from nocobase_client import NocoBaseClient, NocoBaseConfig
+from table_utils import extract_rows, format_table
 
 
 def _coerce_value(text: str) -> Any:
@@ -111,10 +112,18 @@ def main() -> int:
         default=None,
         help="查询参数：key=value（可重复，例如 --param page=1 --param pageSize=10）",
     )
+    r_list.add_argument("--table", action="store_true", help="以表格形式输出 data（仅展示扁平字段）")
+    r_list.add_argument(
+        "--columns",
+        default=None,
+        help="表格列（逗号分隔），例如 id,name,createdAt",
+    )
 
     r_get = records_sub.add_parser("get", help="查询单条（按主键）")
     r_get.add_argument("--collection", required=True, help="数据表标识，例如 test1")
     r_get.add_argument("--pk", required=True, help="主键值（一般是 id）")
+    r_get.add_argument("--table", action="store_true", help="以表格形式输出 data")
+    r_get.add_argument("--columns", default=None, help="表格列（逗号分隔）")
 
     r_update = records_sub.add_parser("update", help="更新单条（按主键）")
     r_update.add_argument("--collection", required=True, help="数据表标识，例如 test1")
@@ -145,9 +154,13 @@ def main() -> int:
         default=None,
         help="查询参数：key=value（可重复）",
     )
+    c_list.add_argument("--table", action="store_true", help="以表格形式输出 data")
+    c_list.add_argument("--columns", default=None, help="表格列（逗号分隔）")
 
     c_get = collections_sub.add_parser("get", help="获取某个数据表定义")
     c_get.add_argument("--name", required=True, help="数据表标识，例如 test1")
+    c_get.add_argument("--table", action="store_true", help="以表格形式输出 data")
+    c_get.add_argument("--columns", default=None, help="表格列（逗号分隔）")
 
     c_create = collections_sub.add_parser("create", help="创建数据表（payload 见官方文档）")
     c_create.add_argument("--json", default=None, help="payload(JSON 字符串)")
@@ -203,11 +216,19 @@ def main() -> int:
         if args.op == "list":
             params = _parse_json_arg(args.params, args.params_file) or _parse_kv_pairs(args.param) or {}
             resp = client.list(args.collection, params=params)
-            print(json.dumps(resp, ensure_ascii=False))
+            if args.table:
+                cols = [c.strip() for c in (args.columns or "").split(",") if c.strip()] or None
+                print(format_table(extract_rows(resp), columns=cols))
+            else:
+                print(json.dumps(resp, ensure_ascii=False))
             return 0
         if args.op == "get":
             resp = client.get(args.collection, pk=args.pk)
-            print(json.dumps(resp, ensure_ascii=False))
+            if args.table:
+                cols = [c.strip() for c in (args.columns or "").split(",") if c.strip()] or None
+                print(format_table(extract_rows(resp), columns=cols))
+            else:
+                print(json.dumps(resp, ensure_ascii=False))
             return 0
         if args.op == "update":
             values = _parse_json_arg(args.json, args.json_file) or _parse_kv_pairs(args.set)
@@ -225,11 +246,19 @@ def main() -> int:
         if args.op == "list":
             params = _parse_json_arg(args.params, args.params_file) or _parse_kv_pairs(args.param) or {}
             resp = client.collections_list(params=params)
-            print(json.dumps(resp, ensure_ascii=False))
+            if args.table:
+                cols = [c.strip() for c in (args.columns or "").split(",") if c.strip()] or None
+                print(format_table(extract_rows(resp), columns=cols))
+            else:
+                print(json.dumps(resp, ensure_ascii=False))
             return 0
         if args.op == "get":
             resp = client.collections_get(name=args.name)
-            print(json.dumps(resp, ensure_ascii=False))
+            if args.table:
+                cols = [c.strip() for c in (args.columns or "").split(",") if c.strip()] or None
+                print(format_table(extract_rows(resp), columns=cols))
+            else:
+                print(json.dumps(resp, ensure_ascii=False))
             return 0
         if args.op == "create":
             payload = _parse_json_arg(args.json, args.json_file)

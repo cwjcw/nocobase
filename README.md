@@ -30,6 +30,9 @@ python .\nocobase_cli.py records create --collection test1 --set name=测试数�
 # 查列表
 python .\nocobase_cli.py records list --collection test1 --param page=1 --param pageSize=10
 
+# 查列表并用表格输出
+python .\nocobase_cli.py records list --collection test1 --param page=1 --param pageSize=10 --table --columns id,name,f_h2v1n6u8mfh,createdAt
+
 # 查单条（按 id）
 python .\nocobase_cli.py records get --collection test1 --pk 123
 
