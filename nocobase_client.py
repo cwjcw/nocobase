@@ -470,3 +470,363 @@ class NocoBaseClient:
         """
 
         return self.request("POST", "collections:setFields", json=payload)
+
+
+def _is_empty_cell(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        import pandas as pd  # type: ignore
+
+        return bool(pd.isna(value))
+    except Exception:
+        pass
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
+
+
+def _to_python_scalar(value: Any) -> Any:
+    if _is_empty_cell(value):
+        return None
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _convert_by_field_type(value: Any, field_def: Optional[Dict[str, Any]]) -> Any:
+    """
+    根据字段定义尽量把 Excel 单元格值转换为更合适的类型。
+
+    目前处理：日期时间、整数、浮点数，其它保持原样（或转为字符串）。
+    """
+
+    v = _to_python_scalar(value)
+    if v is None or not field_def:
+        return v
+
+    field_type = field_def.get("type")
+
+    # 日期时间：尽量输出为字符串（NocoBase 一般可接受）
+    if field_type in {"date", "datetime", "datetimeNoTz"}:
+        try:
+            if hasattr(v, "to_pydatetime"):
+                dt = v.to_pydatetime()
+                return dt.isoformat(sep=" ", timespec="seconds")
+            if hasattr(v, "isoformat"):
+                return v.isoformat(sep=" ", timespec="seconds")  # type: ignore[arg-type]
+        except Exception:
+            return str(v)
+        return str(v)
+
+    # 数字类型
+    if field_type in {"double", "float", "decimal"}:
+        try:
+            return float(v)
+        except Exception:
+            return v
+    if field_type in {"integer", "bigInt", "sort", "snowflakeId"}:
+        try:
+            if isinstance(v, float) and v.is_integer():
+                return int(v)
+            if isinstance(v, str) and v.strip().isdigit():
+                return int(v.strip())
+            return int(float(v))
+        except Exception:
+            return v
+
+    return v
+
+
+def _extract_fields_from_collection_get(resp: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return {}
+    fields = data.get("fields")
+    if not isinstance(fields, list):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        name = f.get("name")
+        if isinstance(name, str) and name:
+            out[name] = f
+    return out
+
+
+def _field_titles(field_def: Dict[str, Any]) -> Tuple[str, ...]:
+    titles: List[str] = []
+    for key in ("title", "label"):
+        v = field_def.get(key)
+        if isinstance(v, str) and v.strip():
+            titles.append(v.strip())
+    ui = field_def.get("uiSchema")
+    if isinstance(ui, dict):
+        v = ui.get("title")
+        if isinstance(v, str) and v.strip():
+            titles.append(v.strip())
+
+    seen = set()
+    uniq: List[str] = []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return tuple(uniq)
+
+
+def build_excel_field_mapping(
+    *,
+    excel_columns: Iterable[str],
+    collection_fields: Dict[str, Dict[str, Any]],
+    explicit_mapping: Optional[Dict[str, str]] = None,
+    exclude_field_types: Optional[Iterable[str]] = None,
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    构建 Excel 列名 -> NocoBase 字段标识 的映射。
+
+    优先级：
+    1) explicit_mapping（你手工指定的 mapping）
+    2) Excel 列名 == 字段标识（field.name）
+    3) Excel 列名 == 字段标题（field.title / field.uiSchema.title）
+
+    返回：
+    - mapping: {Excel列名: 字段标识}
+    - reasons: {Excel列名: 命中原因}
+    """
+
+    mapping: Dict[str, str] = {}
+    reasons: Dict[str, str] = {}
+    excluded = set(exclude_field_types or [])
+
+    def allowed_field(field_name: str) -> bool:
+        if not excluded:
+            return True
+        fdef = collection_fields.get(field_name) or {}
+        ftype = fdef.get("type")
+        return ftype not in excluded
+
+    # 1) 手工映射
+    if explicit_mapping:
+        for excel_col, field_name in explicit_mapping.items():
+            if excel_col in mapping:
+                continue
+            if field_name in collection_fields:
+                mapping[excel_col] = field_name
+                reasons[excel_col] = "explicit"
+
+    # 2) 列名直接等于字段标识
+    for col in excel_columns:
+        if col in mapping:
+            continue
+        if col in collection_fields and allowed_field(col):
+            mapping[col] = col
+            reasons[col] = "match_field_name"
+
+    # 3) 列名等于字段标题（避免歧义：同标题只取第一个）
+    title_to_name: Dict[str, str] = {}
+    for name, fdef in collection_fields.items():
+        if not allowed_field(name):
+            continue
+        for title in _field_titles(fdef):
+            if title not in title_to_name:
+                title_to_name[title] = name
+
+    for col in excel_columns:
+        if col in mapping:
+            continue
+        target = title_to_name.get(col)
+        if target:
+            mapping[col] = target
+            reasons[col] = "match_field_title"
+
+    return mapping, reasons
+
+
+def import_excel_to_collection(
+    *,
+    client: NocoBaseClient,
+    collection: str,
+    excel_path: str,
+    sheet: Any = 0,
+    limit: int = 0,
+    dry_run: bool = False,
+    explicit_mapping: Optional[Dict[str, str]] = None,
+    resolve_belongs_to: bool = True,
+    create_missing_belongs_to: bool = False,
+) -> Dict[str, Any]:
+    """
+    读取 Excel 并把每一行新增到指定数据表（collection）。
+
+    你想要的“只输入表名 + Excel 地址即可导入”的入口就是这个函数：
+      - collection：表标识（例如 qjzb_orders）
+      - excel_path：Excel 文件路径（例如 .\\data\\订单列表.xlsx）
+
+    参数：
+    - client: NocoBaseClient 实例（已配置 base_url/token）
+    - collection: 目标数据表标识（例如 qjzb_orders）
+    - excel_path: Excel 路径（xlsx/xlsm/xls）
+    - sheet: sheet 名称或序号（默认 0）
+    - limit: 只导入前 N 行（0 表示全部）
+    - dry_run: True 时不写入，只打印/返回将写入的 values
+    - explicit_mapping: 手工映射（Excel列名 -> 字段标识），用于覆盖/补充自动映射
+    - resolve_belongs_to: 是否把 Excel 里的字符串值解析为 belongsTo 外键 ID（默认 True）
+    - create_missing_belongs_to: 当 belongsTo 目标表里找不到该字符串时，是否自动创建（默认 False）
+
+    返回：
+    - dict，包含：success/failed/total/mapping/unmapped 等统计信息。
+    """
+
+    try:
+        import pandas as pd  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("缺少依赖 pandas，请先 pip install -r requirements.txt") from exc
+
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"Excel 文件不存在：{excel_path}")
+
+    df = pd.read_excel(excel_path, sheet_name=sheet, dtype=object)
+    df = df.dropna(axis=0, how="all")
+    df = df.dropna(axis=1, how="all")
+    if df.empty:
+        raise ValueError("Excel 为空或只有空行/空列")
+
+    col_resp = client.collections_get(name=collection)
+    fields = _extract_fields_from_collection_get(col_resp)
+
+    exclude_types = None
+    if not resolve_belongs_to:
+        # 不解析关联字段时，默认不自动映射关联字段，避免把文本写进外键导致失败或脏数据。
+        exclude_types = {"belongsTo", "belongsToMany", "hasMany", "hasOne"}
+
+    mapping, reasons = build_excel_field_mapping(
+        excel_columns=[str(c) for c in df.columns],
+        collection_fields=fields,
+        explicit_mapping=explicit_mapping,
+        exclude_field_types=exclude_types,
+    )
+    unmapped = [str(c) for c in df.columns if str(c) not in mapping]
+
+    total = len(df) if limit <= 0 else min(len(df), limit)
+    success = 0
+    failed = 0
+    preview: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    belongs_to_cache: Dict[Tuple[str, str, str], Any] = {}
+
+    def resolve_belongs_to_fk(*, field_def: Dict[str, Any], display_value: Any) -> Any:
+        target = field_def.get("target")
+        foreign_key = field_def.get("foreignKey")
+        if not isinstance(target, str) or not target:
+            raise RuntimeError("belongsTo 缺少 target")
+        if not isinstance(foreign_key, str) or not foreign_key:
+            raise RuntimeError("belongsTo 缺少 foreignKey")
+
+        label = str(display_value).strip()
+        if not label:
+            return None
+
+        # 确定 target 的“标题字段”（通常是 name/unit/title 等）
+        target_def = client.collections_get(name=target).get("data") or {}
+        title_field = target_def.get("titleField")
+        if not isinstance(title_field, str) or not title_field:
+            title_field = "name"
+
+        cache_key = (target, title_field, label)
+        if cache_key in belongs_to_cache:
+            return belongs_to_cache[cache_key]
+
+        # 为了兼容不同版本的 filter 语法，这里先用小表全量扫描（常用于字典表）
+        rows = client.list(target, params={"page": 1, "pageSize": 2000}).get("data") or []
+        if isinstance(rows, list):
+            for r in rows:
+                if isinstance(r, dict) and str(r.get(title_field, "")).strip() == label:
+                    pk = r.get("id")
+                    belongs_to_cache[cache_key] = pk
+                    return pk
+
+        if create_missing_belongs_to:
+            created = client.create(target, {title_field: label})
+            pk = (created.get("data") or {}).get("id")
+            belongs_to_cache[cache_key] = pk
+            return pk
+
+        raise RuntimeError(f"belongsTo 未找到目标记录：{target}.{title_field} == {label}")
+
+    for i in range(total):
+        row = df.iloc[i]
+        values: Dict[str, Any] = {}
+        for excel_col, field_name in mapping.items():
+            field_def = fields.get(field_name)
+            raw = row.get(excel_col)
+
+            # belongsTo：把 Excel 的字符串解析为外键 ID，写入 foreignKey
+            if resolve_belongs_to and isinstance(field_def, dict) and field_def.get("type") == "belongsTo":
+                try:
+                    v0 = _to_python_scalar(raw)
+                    if v0 is None:
+                        continue
+                    fk_value = resolve_belongs_to_fk(field_def=field_def, display_value=v0)
+                    fk_name = field_def.get("foreignKey")
+                    if fk_value is None or not isinstance(fk_name, str) or not fk_name:
+                        continue
+                    values[fk_name] = fk_value
+                    continue
+                except Exception as exc:
+                    # belongsTo 解析失败，记录错误并让这一行失败
+                    raise RuntimeError(f"belongsTo 字段解析失败：{field_name}({excel_col})：{exc}") from exc
+
+            v = _convert_by_field_type(raw, field_def)
+            if v is None:
+                continue
+            values[field_name] = v
+
+        if not values:
+            continue
+
+        if dry_run:
+            preview.append(values)
+            success += 1
+            continue
+
+        try:
+            resp = client.create(collection, values)
+            # 有些场景后端会返回 200 但 body 含 errors；这里将其视为失败
+            if isinstance(resp, dict) and resp.get("errors"):
+                raise RuntimeError(resp.get("errors"))
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if not isinstance(data, dict) or not data.get("id"):
+                raise RuntimeError(f"create 返回异常：{resp}")
+            success += 1
+        except Exception as exc:
+            failed += 1
+            err: Dict[str, Any] = {"row": i + 1, "error": str(exc), "values": values}
+            resp = getattr(exc, "response", None)
+            if resp is not None:
+                err["status_code"] = getattr(resp, "status_code", None)
+                try:
+                    err["response_text"] = resp.text
+                except Exception:
+                    pass
+            errors.append(err)
+
+    return {
+        "excel_path": excel_path,
+        "sheet": sheet,
+        "collection": collection,
+        "rows": int(len(df)),
+        "cols": int(len(df.columns)),
+        "mapping": mapping,
+        "mapping_reasons": reasons,
+        "unmapped": unmapped,
+        "total": int(total),
+        "success": int(success),
+        "failed": int(failed),
+        "errors": errors,
+        "preview": preview if dry_run else None,
+    }
