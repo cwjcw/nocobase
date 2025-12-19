@@ -522,13 +522,13 @@ def _convert_by_field_type(value: Any, field_def: Optional[Dict[str, Any]]) -> A
             return str(v)
         return str(v)
 
-    # 数字类型
+    # 数字类型（以及外键 ID）
     if field_type in {"double", "float", "decimal"}:
         try:
             return float(v)
         except Exception:
             return v
-    if field_type in {"integer", "bigInt", "sort", "snowflakeId"}:
+    if field_type in {"integer", "bigInt", "sort", "snowflakeId", "foreignKey"}:
         try:
             if isinstance(v, float) and v.is_integer():
                 return int(v)
@@ -608,6 +608,9 @@ def build_excel_field_mapping(
             return True
         fdef = collection_fields.get(field_name) or {}
         ftype = fdef.get("type")
+        # 允许直接映射外键列（即便 excluded 包含关联类型）
+        if ftype == "foreignKey":
+            return True
         return ftype not in excluded
 
     # 1) 手工映射
@@ -658,6 +661,7 @@ def import_excel_to_collection(
     explicit_mapping: Optional[Dict[str, str]] = None,
     resolve_belongs_to: bool = True,
     create_missing_belongs_to: bool = False,
+    belongs_to_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     读取 Excel 并把每一行新增到指定数据表（collection）。
@@ -676,6 +680,16 @@ def import_excel_to_collection(
     - explicit_mapping: 手工映射（Excel列名 -> 字段标识），用于覆盖/补充自动映射
     - resolve_belongs_to: 是否把 Excel 里的字符串值解析为 belongsTo 外键 ID（默认 True）
     - create_missing_belongs_to: 当 belongsTo 目标表里找不到该字符串时，是否自动创建（默认 False）
+    - belongs_to_overrides: 针对某个 belongsTo 字段的解析覆盖（可选）
+        结构示例（key 是 belongsTo 字段标识，例如 "units"）：
+        {
+          "units": {
+            "target": "product_unit",          # 可选，默认取字段定义里的 target
+            "lookup_field": "unit",            # 可选，默认取 target 表的 titleField 或 "name"
+            "target_key": "id",                # 可选，默认取字段定义里的 targetKey 或 "id"
+            "foreign_key": "unit_forgin_key"   # 可选，默认取字段定义里的 foreignKey
+          }
+        }
 
     返回：
     - dict，包含：success/failed/total/mapping/unmapped 等统计信息。
@@ -698,6 +712,15 @@ def import_excel_to_collection(
     col_resp = client.collections_get(name=collection)
     fields = _extract_fields_from_collection_get(col_resp)
 
+    # 将 belongsTo 的 foreignKey 也纳入“可映射字段”，支持 Excel 直接提供外键 ID 列（例如 unit_forgin_key）
+    fields_for_mapping: Dict[str, Dict[str, Any]] = dict(fields)
+    for fname, fdef in fields.items():
+        if not isinstance(fdef, dict) or fdef.get("type") != "belongsTo":
+            continue
+        fk = fdef.get("foreignKey")
+        if isinstance(fk, str) and fk and fk not in fields_for_mapping:
+            fields_for_mapping[fk] = {"name": fk, "type": "foreignKey"}
+
     exclude_types = None
     if not resolve_belongs_to:
         # 不解析关联字段时，默认不自动映射关联字段，避免把文本写进外键导致失败或脏数据。
@@ -705,7 +728,7 @@ def import_excel_to_collection(
 
     mapping, reasons = build_excel_field_mapping(
         excel_columns=[str(c) for c in df.columns],
-        collection_fields=fields,
+        collection_fields=fields_for_mapping,
         explicit_mapping=explicit_mapping,
         exclude_field_types=exclude_types,
     )
@@ -718,26 +741,87 @@ def import_excel_to_collection(
     errors: List[Dict[str, Any]] = []
 
     belongs_to_cache: Dict[Tuple[str, str, str], Any] = {}
+    target_lookup_cache: Dict[str, List[str]] = {}
 
-    def resolve_belongs_to_fk(*, field_def: Dict[str, Any], display_value: Any) -> Any:
-        target = field_def.get("target")
-        foreign_key = field_def.get("foreignKey")
+    def guess_lookup_fields_for_target(target: str) -> List[str]:
+        if target in target_lookup_cache:
+            return target_lookup_cache[target]
+
+        # 通过 collections:get(appends=fields) 取目标表字段，猜测哪个字段存“名称/文本值”
+        target_resp = client.collections_get(name=target)
+        target_data = target_resp.get("data") if isinstance(target_resp, dict) else None
+        fields = _extract_fields_from_collection_get(target_resp)
+
+        preferred = ["name", "title", "label", "value", "unit", "status"]
+        candidates: List[str] = []
+
+        def add(n: str) -> None:
+            if n and n not in candidates:
+                candidates.append(n)
+
+        for n in preferred:
+            if n in fields:
+                add(n)
+
+        # 其次：unique 的 string/text 字段
+        for n, fdef in fields.items():
+            if n in {"id", "createdAt", "updatedAt", "createdBy", "updatedBy"}:
+                continue
+            if not isinstance(fdef, dict):
+                continue
+            if fdef.get("type") not in {"string", "text"}:
+                continue
+            if fdef.get("unique") is True:
+                add(n)
+
+        # 最后：其它 string/text 字段
+        for n, fdef in fields.items():
+            if n in {"id", "createdAt", "updatedAt", "createdBy", "updatedBy"}:
+                continue
+            if not isinstance(fdef, dict):
+                continue
+            if fdef.get("type") not in {"string", "text"}:
+                continue
+            add(n)
+
+        # 如果 collections 没带 fields，就退回到 titleField 或 name
+        if not candidates and isinstance(target_data, dict):
+            tf = target_data.get("titleField")
+            if isinstance(tf, str) and tf.strip():
+                add(tf.strip())
+
+        if not candidates:
+            add("name")
+
+        target_lookup_cache[target] = candidates
+        return candidates
+
+    def resolve_belongs_to_fk(*, field_name: str, field_def: Dict[str, Any], display_value: Any) -> Any:
+        override = (belongs_to_overrides or {}).get(field_name) or {}
+
+        target = override.get("target", field_def.get("target"))
+        foreign_key = override.get("foreign_key", field_def.get("foreignKey"))
+        target_key = override.get("target_key", field_def.get("targetKey", "id"))
         if not isinstance(target, str) or not target:
             raise RuntimeError("belongsTo 缺少 target")
         if not isinstance(foreign_key, str) or not foreign_key:
             raise RuntimeError("belongsTo 缺少 foreignKey")
+        if not isinstance(target_key, str) or not target_key:
+            target_key = "id"
 
         label = str(display_value).strip()
         if not label:
             return None
 
-        # 确定 target 的“标题字段”（通常是 name/unit/title 等）
+        # 确定 target 的“匹配字段”（可能不是 name；优先 override，其次 titleField，再做启发式猜测）
         target_def = client.collections_get(name=target).get("data") or {}
-        title_field = target_def.get("titleField")
-        if not isinstance(title_field, str) or not title_field:
-            title_field = "name"
+        title_field = override.get("lookup_field", target_def.get("titleField"))
+        lookup_fields: List[str] = []
+        if isinstance(title_field, str) and title_field.strip():
+            lookup_fields.append(title_field.strip())
+        lookup_fields.extend([f for f in guess_lookup_fields_for_target(target) if f not in lookup_fields])
 
-        cache_key = (target, title_field, label)
+        cache_key = (target, lookup_fields[0] if lookup_fields else "name", label)
         if cache_key in belongs_to_cache:
             return belongs_to_cache[cache_key]
 
@@ -745,46 +829,59 @@ def import_excel_to_collection(
         rows = client.list(target, params={"page": 1, "pageSize": 2000}).get("data") or []
         if isinstance(rows, list):
             for r in rows:
-                if isinstance(r, dict) and str(r.get(title_field, "")).strip() == label:
-                    pk = r.get("id")
-                    belongs_to_cache[cache_key] = pk
-                    return pk
+                if not isinstance(r, dict):
+                    continue
+                for lf in lookup_fields:
+                    if str(r.get(lf, "")).strip() == label:
+                        pk = r.get(target_key)
+                        belongs_to_cache[cache_key] = pk
+                        return pk
 
         if create_missing_belongs_to:
-            created = client.create(target, {title_field: label})
-            pk = (created.get("data") or {}).get("id")
+            # 优先写入第一个可用的匹配字段
+            lf0 = lookup_fields[0] if lookup_fields else "name"
+            created = client.create(target, {lf0: label})
+            pk = (created.get("data") or {}).get(target_key) or (created.get("data") or {}).get("id")
             belongs_to_cache[cache_key] = pk
             return pk
 
-        raise RuntimeError(f"belongsTo 未找到目标记录：{target}.{title_field} == {label}")
+        raise RuntimeError(
+            f"belongsTo 未找到目标记录：{target}.({','.join(lookup_fields[:3])}) == {label}"
+        )
 
     for i in range(total):
         row = df.iloc[i]
         values: Dict[str, Any] = {}
-        for excel_col, field_name in mapping.items():
-            field_def = fields.get(field_name)
-            raw = row.get(excel_col)
+        try:
+            for excel_col, field_name in mapping.items():
+                field_def = fields.get(field_name)
+                raw = row.get(excel_col)
 
-            # belongsTo：把 Excel 的字符串解析为外键 ID，写入 foreignKey
-            if resolve_belongs_to and isinstance(field_def, dict) and field_def.get("type") == "belongsTo":
-                try:
+                # belongsTo：把 Excel 的字符串解析为外键 ID，写入 foreignKey
+                if resolve_belongs_to and isinstance(field_def, dict) and field_def.get("type") == "belongsTo":
                     v0 = _to_python_scalar(raw)
                     if v0 is None:
                         continue
-                    fk_value = resolve_belongs_to_fk(field_def=field_def, display_value=v0)
-                    fk_name = field_def.get("foreignKey")
+                    fk_value = resolve_belongs_to_fk(
+                        field_name=field_name,
+                        field_def=field_def,
+                        display_value=v0,
+                    )
+                    override = (belongs_to_overrides or {}).get(field_name) or {}
+                    fk_name = override.get("foreign_key", field_def.get("foreignKey"))
                     if fk_value is None or not isinstance(fk_name, str) or not fk_name:
                         continue
                     values[fk_name] = fk_value
                     continue
-                except Exception as exc:
-                    # belongsTo 解析失败，记录错误并让这一行失败
-                    raise RuntimeError(f"belongsTo 字段解析失败：{field_name}({excel_col})：{exc}") from exc
 
-            v = _convert_by_field_type(raw, field_def)
-            if v is None:
-                continue
-            values[field_name] = v
+                v = _convert_by_field_type(raw, field_def)
+                if v is None:
+                    continue
+                values[field_name] = v
+        except Exception as exc:
+            failed += 1
+            errors.append({"row": i + 1, "error": str(exc), "values": values})
+            continue
 
         if not values:
             continue
